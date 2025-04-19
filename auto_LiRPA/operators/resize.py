@@ -328,3 +328,9 @@ class BoundExpand(Bound):
             else:
                 assert x.shape[i] == 1 or x.shape[i] == y[m - n + i]
         return x.expand(*list(y))
+
+    def interval_propagate(self, *v):
+        assert not self.is_input_perturbed(1), "Shape tensor in BoundExpand cannot be perturbed"
+
+        l, u = zip(*v)
+        return self.forward(*l), self.forward(*u)
