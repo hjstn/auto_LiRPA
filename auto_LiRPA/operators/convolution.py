@@ -357,49 +357,78 @@ class BoundConv(Bound):
         model.update()
 
     def interval_propagate(self, *v, C=None):
-        if self.is_input_perturbed(1):
-            raise NotImplementedError("Weight perturbation for convolution layers has not been implmented.")
+        h_perturbed = not torch.equal(v[0][0], v[0][1])
+        w_perturbed = self.is_input_perturbed(1)
 
-        norm = Interval.get_perturbation(v[0])
-        norm = norm[0]
+        h_norm, h_eps, *_ = Interval.get_perturbation(v[0])
+        w_norm, w_eps, *_ = Interval.get_perturbation(v[1])
 
-        h_L, h_U = v[0]
-        weight = v[1][0]
         bias = v[2][0] if self.has_bias else None
 
-        if norm == torch.inf:
-            mid = (h_U + h_L) / 2.0
-            diff = (h_U - h_L) / 2.0
-            weight_abs = weight.abs()
-            deviation = self.F_conv(diff, weight_abs, None, self.stride, self.padding, self.dilation, self.groups)
-        elif norm > 0:
-            norm, eps = Interval.get_perturbation(v[0])
-            # L2 norm, h_U and h_L are the same.
-            mid = h_U
-            # TODO: padding
-            assert not isinstance(eps, torch.Tensor) or eps.numel() == 1
-            deviation = torch.mul(weight, weight).sum((1, 2, 3)).sqrt() * eps
-            deviation = deviation.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-        else: # Here we calculate the L0 norm IBP bound using the bound proposed in [Certified Defenses for Adversarial Patches, ICLR 2020]
-            norm, eps, ratio = Interval.get_perturbation(v[0])
-            mid = h_U
-            k = int(eps)
-            weight_sum = torch.sum(weight.abs(), 1)
-            deviation = torch.sum(torch.topk(weight_sum.view(weight_sum.shape[0], -1), k)[0], dim=1) * ratio
+        if h_perturbed and not w_perturbed:
+            h_L, h_U = v[0]
+            weight = v[1][0]
 
-            if self.has_bias:
-                center = self.F_conv(mid, weight, v[2][0], self.stride, self.padding, self.dilation, self.groups)
+            if h_norm == torch.inf:
+                mid = (h_U + h_L) / 2.0
+                diff = (h_U - h_L) / 2.0
+                weight_abs = weight.abs()
+                deviation = self.F_conv(diff, weight_abs, None, self.stride, self.padding, self.dilation, self.groups)
+            elif h_norm > 0:
+                # L2 norm, h_U and h_L are the same.
+                mid = h_U
+                # TODO: padding
+                assert not isinstance(h_eps, torch.Tensor) or h_eps.numel() == 1
+                deviation = torch.mul(weight, weight).sum((1, 2, 3)).sqrt() * h_eps
+                deviation = deviation.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            else: # Here we calculate the L0 norm IBP bound using the bound proposed in [Certified Defenses for Adversarial Patches, ICLR 2020]
+                _, _, h_ratio = Interval.get_perturbation(v[0])
+                mid = h_U
+                k = int(h_eps)
+                weight_sum = torch.sum(weight.abs(), 1)
+                deviation = torch.sum(torch.topk(weight_sum.view(weight_sum.shape[0], -1), k)[0], dim=1) * h_ratio
+
+                if self.has_bias:
+                    center = self.F_conv(mid, weight, v[2][0], self.stride, self.padding, self.dilation, self.groups)
+                else:
+                    center = self.F_conv(mid, weight, None, self.stride, self.padding, self.dilation, self.groups)
+
+                ss = center.shape
+                deviation = deviation.repeat(ss[2] * ss[3]).view(-1, ss[1]).t().view(ss[1], ss[2], ss[3])
+
+            center = self.F_conv(mid, weight, bias, self.stride, self.padding, self.dilation, self.groups)
+
+            upper = center + deviation
+            lower = center - deviation
+            return lower, upper
+        elif w_perturbed and not h_perturbed:
+            h = v[0][0]
+            w_L, w_U = v[1]
+
+            if w_norm == torch.inf:
+                w_mid = (w_U + w_L) / 2.0
+                w_diff = (w_U - w_L) / 2.0
+
+                h_positive = torch.clamp(h, min=0)
+                h_negative = torch.clamp(h, max=0)
+
+                deviation_positive = self.F_conv(h_positive, w_diff.abs(), None, self.stride, self.padding, self.dilation, self.groups)
+                deviation_negative = self.F_conv(h_negative, -w_diff.abs(), None, self.stride, self.padding, self.dilation, self.groups)
+
+                deviation = deviation_positive + deviation_negative
             else:
-                center = self.F_conv(mid, weight, None, self.stride, self.padding, self.dilation, self.groups)
+                raise NotImplementedError("Non-Linf weight perturbation for convolution layers has not been implemented.")
 
-            ss = center.shape
-            deviation = deviation.repeat(ss[2] * ss[3]).view(-1, ss[1]).t().view(ss[1], ss[2], ss[3])
+            center = self.F_conv(h, w_mid, bias, self.stride, self.padding, self.dilation, self.groups)
 
-        center = self.F_conv(mid, weight, bias, self.stride, self.padding, self.dilation, self.groups)
-
-        upper = center + deviation
-        lower = center - deviation
-        return lower, upper
+            upper = center + deviation
+            lower = center - deviation
+            return lower, upper
+        elif not w_perturbed and not h_perturbed:
+            center = self.F_conv(v[0][0], v[1][0], bias, self.stride, self.padding, self.dilation, self.groups)
+            return center, center
+        else:
+            raise NotImplementedError("Layer and weight perturbation for convolution layers has not been implemented.")
 
     def bound_dynamic_forward(self, *x, max_dim=None, offset=0):
         if self.is_input_perturbed(1) or self.is_input_perturbed(2):
